@@ -84,6 +84,10 @@ def remove_link(processed_link, input_file='input.txt'):
 with open('input.txt', 'r') as file:
     links = [line.strip() for line in file if line.strip()]
 
+if not links:
+    log.warning("input.txt is empty", "add links and rerun")
+    raise SystemExit(0)
+
 for link in links:
     log.info(f"Started Processing", f"{link[:30]}...{link[60:]}")
     response = requests.get(link, headers=headers)
