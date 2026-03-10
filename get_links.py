@@ -29,13 +29,13 @@ log.clear()
 url = log.input("Enter Fitgirl Game Link : ")
 try:
     r = requests.get(url)
-    r.raise_for_status()  # fail fast on HTTP errors instead of silently parsing a bad response
+    r.raise_for_status()
 except requests.exceptions.RequestException as e:
     log.error("HTTP request failed", f"{url} ({e})")
     raise SystemExit(1)
 
 soup = BeautifulSoup(r.text, "html.parser")
-# each filehoster has its own dlinks div; find_all catches all of them
+
 links = [
     a["href"]
     for dlinks_div in soup.find_all("div", class_="dlinks")
@@ -49,4 +49,5 @@ else:
     print("🔗 Matching URLs :")
     print(output)
     pyperclip.copy(output)
+
     log.success("All Links Copied To Clipboard", len(links))
