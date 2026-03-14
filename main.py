@@ -88,8 +88,10 @@ if not links:
     raise SystemExit(1)
 
 first_game_link = next((l for l in links if "fitgirl-repacks.site" in urlparse(l).fragment), None)
-fragment = urlparse(first_game_link).fragment if first_game_link else ""
-game_name = fragment.split("--")[0].strip("_") if fragment else "unknown_game"
+if not first_game_link:
+    log.error("Could not determine game name", "no fitgirl part files found in input.txt")
+    raise SystemExit(1)
+game_name = urlparse(first_game_link).fragment.split("--")[0].strip("_")
 downloads_folder = os.path.join("downloads", game_name)
 os.makedirs(downloads_folder, exist_ok=True)
 log.info("Download folder", downloads_folder)
