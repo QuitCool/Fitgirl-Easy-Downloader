@@ -7,15 +7,9 @@ This Tool Helps To Download Multiple Files Easily From fitgirl-repacks.site Thro
 Ensure you have the following installed before running the script :
 
 - Python 3.8+
-- Required Python packages :
-  - `requests`
-  - `beautifulsoup4`
-  - `tqdm`
-  - `colorama`
-  - `pyperclip`
 
 ```bash
-pip install requests beautifulsoup4 tqdm colorama pyperclip
+pip install -r requirements.txt
 ```
 
 ## Usage
