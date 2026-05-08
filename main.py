@@ -25,7 +25,7 @@ class Console:
 
     def _print(self, lvl_color, lvl, msg, obj):
         c = self._C
-        print(f"{c['lb']}{self._ts()} » {lvl_color}{lvl} {c['lb']}• {c['w']}{msg} : {lvl_color}{obj}{c['R']}")
+        tqdm.write(f"{c['lb']}{self._ts()} » {lvl_color}{lvl} {c['lb']}• {c['w']}{msg} : {lvl_color}{obj}{c['R']}")
 
     def clear(self):
         os.system("cls" if os.name == "nt" else "clear")
@@ -117,8 +117,11 @@ def resolve_fuckingfast(ff_url):
 def get_remote_size(url):
     """Return remote file size in bytes (0 if unknown)."""
     try:
-        r = requests.head(url, headers=HEADERS, timeout=15, allow_redirects=True)
-        return int(r.headers.get('content-length', 0))
+        # HEAD is often ignored by CDNs; use GET+stream and close immediately
+        r = requests.get(url, headers=HEADERS, timeout=15, stream=True)
+        size = int(r.headers.get('content-length', 0))
+        r.close()
+        return size
     except Exception:
         return 0
 
@@ -201,9 +204,9 @@ def fmt_bytes(b):
 
 def main():
     log.clear()
-    print(f"{Fore.LIGHTMAGENTA_EX}{'─' * 62}")
-    print(f"  FitGirl Easy Downloader")
-    print(f"{'─' * 62}{Style.RESET_ALL}\n")
+    tqdm.write(f"{Fore.LIGHTMAGENTA_EX}{'─' * 62}")
+    tqdm.write(f"  FitGirl Easy Downloader")
+    tqdm.write(f"{'─' * 62}{Style.RESET_ALL}\n")
 
     fitgirl_url = log.prompt("Enter FitGirl game URL : ").strip()
     if not fitgirl_url:
@@ -259,22 +262,24 @@ def main():
     total_remote   = sum(s[4] for s in sizes)
     total_existing = sum(s[3] for s in sizes)
 
-    log.info("Total size",        fmt_bytes(total_remote))
-    log.info("Already downloaded", fmt_bytes(total_existing))
-    log.info("Remaining",          fmt_bytes(max(0, total_remote - total_existing)))
-    print()
+    log.info("Total size",         fmt_bytes(total_remote) if total_remote else "unknown")
+    log.info("Already downloaded",  fmt_bytes(total_existing))
+    log.info("Remaining",           fmt_bytes(max(0, total_remote - total_existing)) if total_remote else "unknown")
+    tqdm.write("")
 
     # 4 — download with dual progress bars
+    # If we couldn't fetch sizes, use total=None (spinner) to avoid a broken 0/0 bar
+    overall_total = total_remote if total_remote > 0 else None
     overall_bar = tqdm(
-        total=total_remote,
-        initial=total_existing,
+        total=overall_total,
+        initial=total_existing if overall_total else 0,
         unit='B',
         unit_scale=True,
         unit_divisor=1024,
         desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{len(resolved)} files]{Style.RESET_ALL}",
         position=0,
         leave=True,
-        bar_format=BAR_FMT,
+        bar_format=BAR_FMT if overall_total else '{desc} {n_fmt} [{rate_fmt}]',
         dynamic_ncols=True,
         colour='magenta',
     )
@@ -295,14 +300,14 @@ def main():
                 log.error(f"Failed [{i}/{len(sizes)}]", fname)
         except KeyboardInterrupt:
             overall_bar.close()
-            print()
+            tqdm.write("")
             log.warning("Download interrupted", "progress saved — rerun to continue")
             sys.exit(0)
         except Exception as e:
             log.error(f"Error [{i}/{len(sizes)}]", str(e))
 
     overall_bar.close()
-    print()
+    tqdm.write("")
     log.done("All done", f"{success_count}/{len(sizes)} files  →  {downloads_folder}")
 
 
