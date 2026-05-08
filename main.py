@@ -1,46 +1,50 @@
-import os, re, requests
+import os
+import re
+import sys
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from datetime import datetime
-from colorama import Fore, Style
+from colorama import Fore, Style, init
 
+init()
 
-class console:
-    def __init__(self) -> None:
-        self.colors = {"green": Fore.GREEN, "red": Fore.RED, "yellow": Fore.YELLOW, "blue": Fore.BLUE, "magenta": Fore.MAGENTA, "cyan": Fore.CYAN, "white": Fore.WHITE, "black": Fore.BLACK, "reset": Style.RESET_ALL, "lightblack": Fore.LIGHTBLACK_EX, "lightred": Fore.LIGHTRED_EX, "lightgreen": Fore.LIGHTGREEN_EX, "lightyellow": Fore.LIGHTYELLOW_EX, "lightblue": Fore.LIGHTBLUE_EX, "lightmagenta": Fore.LIGHTMAGENTA_EX, "lightcyan": Fore.LIGHTCYAN_EX, "lightwhite": Fore.LIGHTWHITE_EX}
+# ── Console helper ────────────────────────────────────────────────────────────
+
+class Console:
+    _C = {
+        'lb': Fore.LIGHTBLACK_EX,  'lr': Fore.LIGHTRED_EX,   'lg': Fore.LIGHTGREEN_EX,
+        'ly': Fore.LIGHTYELLOW_EX, 'lb2': Fore.LIGHTBLUE_EX, 'lm': Fore.LIGHTMAGENTA_EX,
+        'lc': Fore.LIGHTCYAN_EX,   'w': Fore.WHITE,           'R': Style.RESET_ALL,
+    }
+
+    def _ts(self):
+        return datetime.now().strftime("%H:%M:%S")
+
+    def _print(self, lvl_color, lvl, msg, obj):
+        c = self._C
+        print(f"{c['lb']}{self._ts()} » {lvl_color}{lvl} {c['lb']}• {c['w']}{msg} : {lvl_color}{obj}{c['R']}")
 
     def clear(self):
         os.system("cls" if os.name == "nt" else "clear")
 
-    def timestamp(self):
-        return datetime.now().strftime("%H:%M:%S")
-    
-    def success(self, message, obj):
-        print(f"{self.colors['lightblack']}{self.timestamp()} » {self.colors['lightgreen']}SUCC {self.colors['lightblack']}• {self.colors['white']}{message} : {self.colors['lightgreen']}{obj}{self.colors['white']} {self.colors['reset']}")
+    def success(self, m, o): self._print(self._C['lg'],  'SUCC', m, o)
+    def error(self, m, o):   self._print(self._C['lr'],  'ERRR', m, o)
+    def warning(self, m, o): self._print(self._C['ly'],  'WARN', m, o)
+    def info(self, m, o):    self._print(self._C['lb2'], 'INFO', m, o)
+    def done(self, m, o):    self._print(self._C['lm'],  'DONE', m, o)
 
-    def error(self, message, obj):
-        print(f"{self.colors['lightblack']}{self.timestamp()} » {self.colors['lightred']}ERRR {self.colors['lightblack']}• {self.colors['white']}{message} : {self.colors['lightred']}{obj}{self.colors['white']} {self.colors['reset']}")
+    def prompt(self, message):
+        c = self._C
+        return input(f"{c['lb']}{self._ts()} » {c['lc']}INPUT {c['lb']}• {c['w']}{message}{c['R']}")
 
-    def done(self, message, obj):
-        print(f"{self.colors['lightblack']}{self.timestamp()} » {self.colors['lightmagenta']}DONE {self.colors['lightblack']}• {self.colors['white']}{message} : {self.colors['lightmagenta']}{obj}{self.colors['white']} {self.colors['reset']}")
+log = Console()
 
-    def warning(self, message, obj):
-        print(f"{self.colors['lightblack']}{self.timestamp()} » {self.colors['lightyellow']}WARN {self.colors['lightblack']}• {self.colors['white']}{message} : {self.colors['lightyellow']}{obj}{self.colors['white']} {self.colors['reset']}")
+# ── HTTP headers ──────────────────────────────────────────────────────────────
 
-    def info(self, message, obj):
-        print(f"{self.colors['lightblack']}{self.timestamp()} » {self.colors['lightblue']}INFO {self.colors['lightblack']}• {self.colors['white']}{message} : {self.colors['lightblue']}{obj}{self.colors['white']} {self.colors['reset']}")
-
-    def custom(self, message, obj, color):
-        print(f"{self.colors['lightblack']}{self.timestamp()} » {self.colors[color.upper()]}{color.upper()} {self.colors['lightblack']}• {self.colors['white']}{message} : {self.colors[color.upper()]}{obj}{self.colors['white']} {self.colors['reset']}")
-
-    def input(self, message):
-        return input(f"{self.colors['lightblack']}{self.timestamp()} » {self.colors['lightcyan']}INPUT   {self.colors['lightblack']}• {self.colors['white']}{message}{self.colors['reset']}")
-
-log = console()
-log.clear()
-
-headers = {
+HEADERS = {
     'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'accept-language': 'en-US,en;q=0.5',
     'referer': 'https://fitgirl-repacks.site/',
@@ -50,83 +54,258 @@ headers = {
     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
 }
 
-def download_file(download_url, output_path):
-    response = requests.get(download_url, stream=True)
-    if response.status_code == 200:
-        total_size = int(response.headers.get('content-length', 0))
-        block_size = 8192
+BAR_FMT = '{desc} {percentage:3.0f}%|{bar:28}| {n_fmt}/{total_fmt} [{rate_fmt}, ETA {remaining}]'
 
-        with open(output_path, 'wb') as f, tqdm(
-            total=total_size,
-            unit='B',
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as bar:
-            for data in response.iter_content(block_size):
-                f.write(data)
-                bar.set_description(f"{log.colors['lightblack']}{log.timestamp()} » {log.colors['lightblue']}INFO {log.colors['lightblack']}• {log.colors['white']}Downloading -> {os.path.basename(output_path)[:55]} {log.colors['reset']}")
-                bar.update(len(data))
+# ── Scraping helpers ──────────────────────────────────────────────────────────
 
-        log.success(f"Successfully Downloaded File", F"{output_path[:35]}...{output_path[55:]}")
+def scrape_fitgirl(fitgirl_url):
+    """Fetch a FitGirl repack page and return (game_name, [fuckingfast_urls])."""
+    log.info("Fetching FitGirl page", fitgirl_url)
+    try:
+        r = requests.get(fitgirl_url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log.error("Failed to fetch FitGirl page", str(e))
+        sys.exit(1)
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+
+    # Game name from page title  e.g. "It Takes Two » FitGirl Repacks"
+    title_tag = soup.find('title')
+    if title_tag:
+        raw = title_tag.text.split('»')[0].strip()
+        game_name = re.sub(r'[\\/:*?"<>|]', '', raw).strip()
     else:
-        log.error(f"Failed To Download File", response.status_code)
+        game_name = urlparse(fitgirl_url).path.strip('/').split('/')[-1].replace('-', ' ').title()
 
-def remove_link(processed_link, input_file='input.txt'):
-    with open(input_file, 'r') as file:
-        links = file.readlines()
-        
-    with open(input_file, 'w') as file:
-        for link in links:
-            if link.strip() != processed_link:
-                file.write(link)
+    links = [
+        a['href']
+        for div in soup.find_all('div', class_='dlinks')
+        for a in div.find_all('a', href=True)
+        if a['href'].startswith('https://fuckingfast.co/')
+    ]
 
-with open('input.txt', 'r') as file:
-    links = [line.strip() for line in file if line.strip()]
+    if not links:
+        log.error("No fuckingfast.co links found on page", "check the URL and retry")
+        sys.exit(1)
 
-if not links:
-    log.warning("input.txt is empty", "add links and rerun")
-    raise SystemExit(1)
+    log.success("Found download links", len(links))
+    return game_name, links
 
-first_game_link = next((l for l in links if "fitgirl-repacks.site" in urlparse(l).fragment), None)
-if not first_game_link:
-    log.error("Could not determine game name", "no fitgirl part files found in input.txt")
-    raise SystemExit(1)
-game_name = urlparse(first_game_link).fragment.split("--")[0].strip("_")
-downloads_folder = os.path.join("downloads", game_name)
-os.makedirs(downloads_folder, exist_ok=True)
-log.info("Download folder", downloads_folder)
 
-for link in links:
-    log.info(f"Started Processing", f"{link[:30]}...{link[60:]}")
-    response = requests.get(link, headers=headers)
+def resolve_fuckingfast(ff_url):
+    """Return (filename, direct_download_url) from a fuckingfast.co page."""
+    try:
+        r = requests.get(ff_url, headers=HEADERS, timeout=30)
+    except requests.RequestException as e:
+        log.error("Failed to fetch fuckingfast page", str(e))
+        return None, None
 
-    if response.status_code != 200:
-        log.error(f"Failed To Fetch Page", response.status_code)
-        continue
+    soup = BeautifulSoup(r.text, 'html.parser')
+    meta = soup.find('meta', attrs={'name': 'title'})
+    file_name = meta['content'] if meta else os.path.basename(urlparse(ff_url).path)
 
-    soup = BeautifulSoup(response.text, 'html.parser')
-    meta_title = soup.find('meta', attrs={'name': 'title'})
-    file_name = meta_title['content'] if meta_title else "default_file_name"
-    script_tags = soup.find_all('script')
-    download_function = None
-    for script in script_tags:
+    for script in soup.find_all('script'):
         if 'function download' in script.text:
-            download_function = script.text
-            break
+            m = re.search(r"window\.open\([\"'](https?://[^\s\"'\)]+)", script.text)
+            if m:
+                return file_name, m.group(1)
 
-    if download_function:
-        match = re.search(r'window\.open\(["\'](https?://[^\s"\'\)]+)', download_function)
-        if match:
-            download_url = match.group(1)
-            log.info(f"Found Download Url", f"{download_url[:70]}...")
-            output_path = os.path.join(downloads_folder, file_name)
-            try:
-                download_file(download_url, output_path)
-                remove_link(link)
-            except Exception as e:
-                log.error(f"Failed To Download File", str(e))
-        else:
-            log.error("No Download Url Found", response.status_code)
-    else:
-        log.error("Download Function Not Found", response.status_code)
-        
+    return file_name, None
+
+
+def get_remote_size(url):
+    """Return remote file size in bytes (0 if unknown)."""
+    try:
+        r = requests.head(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        return int(r.headers.get('content-length', 0))
+    except Exception:
+        return 0
+
+# ── Download ──────────────────────────────────────────────────────────────────
+
+def download_file(url, output_path, file_index, total_files, overall_bar):
+    """
+    Download *url* to *output_path* with resume support.
+    Drives both a per-file tqdm bar (position=1) and the shared overall_bar (position=0).
+    Returns True on success.
+    """
+    existing = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+
+    req_headers = dict(HEADERS)
+    if existing > 0:
+        req_headers['Range'] = f'bytes={existing}-'
+        log.info("Resuming", f"{os.path.basename(output_path)} ({existing:,} bytes already done)")
+
+    try:
+        r = requests.get(url, headers=req_headers, stream=True, timeout=60)
+    except requests.RequestException as e:
+        log.error("Request failed", str(e))
+        return False
+
+    # 416 = Range Not Satisfiable → file already fully downloaded
+    if r.status_code == 416:
+        log.success("Already complete", os.path.basename(output_path))
+        return True
+
+    if r.status_code not in (200, 206):
+        log.error("Unexpected HTTP status", r.status_code)
+        return False
+
+    chunk_total = int(r.headers.get('content-length', 0))
+    file_total  = existing + chunk_total
+
+    short = os.path.basename(output_path)
+    short = (short[:37] + '...') if len(short) > 40 else short
+    desc  = f"{Fore.CYAN}[{file_index}/{total_files}] {short}{Style.RESET_ALL}"
+
+    file_bar = tqdm(
+        total=file_total,
+        initial=existing,
+        unit='B',
+        unit_scale=True,
+        unit_divisor=1024,
+        desc=desc,
+        position=1,
+        leave=False,
+        bar_format=BAR_FMT,
+        dynamic_ncols=True,
+        colour='cyan',
+    )
+
+    mode = 'ab' if existing > 0 else 'wb'
+    try:
+        with open(output_path, mode) as f:
+            for chunk in r.iter_content(8192):
+                if chunk:
+                    f.write(chunk)
+                    file_bar.update(len(chunk))
+                    overall_bar.update(len(chunk))
+    except KeyboardInterrupt:
+        file_bar.close()
+        raise
+    finally:
+        file_bar.close()
+
+    return True
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def fmt_bytes(b):
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} PB"
+
+
+def main():
+    log.clear()
+    print(f"{Fore.LIGHTMAGENTA_EX}{'─' * 62}")
+    print(f"  FitGirl Easy Downloader")
+    print(f"{'─' * 62}{Style.RESET_ALL}\n")
+
+    fitgirl_url = log.prompt("Enter FitGirl game URL : ").strip()
+    if not fitgirl_url:
+        log.error("No URL provided", "exiting")
+        sys.exit(1)
+
+    # 1 — scrape FitGirl page for fuckingfast links
+    game_name, ff_links = scrape_fitgirl(fitgirl_url)
+    downloads_folder = os.path.join("downloads", game_name)
+    os.makedirs(downloads_folder, exist_ok=True)
+    log.info("Download folder", downloads_folder)
+
+    # 2 — resolve each fuckingfast page → direct download URL (parallel)
+    WORKERS = min(16, len(ff_links))
+    log.info("Resolving direct URLs", f"{len(ff_links)} links  (workers: {WORKERS})")
+    resolved_map = {}  # index → (fname, durl)
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = {pool.submit(resolve_fuckingfast, url): i for i, url in enumerate(ff_links)}
+        for fut in as_completed(futures):
+            i   = futures[fut]
+            url = ff_links[i]
+            fname, durl = fut.result()
+            if durl:
+                resolved_map[i] = (fname, durl)
+                log.success(f"Resolved [{len(resolved_map)}/{len(ff_links)}]", fname)
+            else:
+                log.warning(f"Could not resolve", url)
+
+    # keep original order
+    resolved = [resolved_map[i] for i in sorted(resolved_map)]
+
+    if not resolved:
+        log.error("No resolvable download URLs found", "exiting")
+        sys.exit(1)
+
+    # 3 — fetch file sizes in parallel
+    log.info("Fetching file sizes", f"{len(resolved)} files  (workers: {WORKERS})")
+
+    def _size_entry(item):
+        fname, durl = item
+        out      = os.path.join(downloads_folder, fname)
+        existing = os.path.getsize(out) if os.path.exists(out) else 0
+        remote   = get_remote_size(durl)
+        return (fname, durl, out, existing, remote)
+
+    sizes_map = {}
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = {pool.submit(_size_entry, item): i for i, item in enumerate(resolved)}
+        for fut in as_completed(futures):
+            sizes_map[futures[fut]] = fut.result()
+
+    sizes = [sizes_map[i] for i in range(len(resolved))]
+    total_remote   = sum(s[4] for s in sizes)
+    total_existing = sum(s[3] for s in sizes)
+
+    log.info("Total size",        fmt_bytes(total_remote))
+    log.info("Already downloaded", fmt_bytes(total_existing))
+    log.info("Remaining",          fmt_bytes(max(0, total_remote - total_existing)))
+    print()
+
+    # 4 — download with dual progress bars
+    overall_bar = tqdm(
+        total=total_remote,
+        initial=total_existing,
+        unit='B',
+        unit_scale=True,
+        unit_divisor=1024,
+        desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{len(resolved)} files]{Style.RESET_ALL}",
+        position=0,
+        leave=True,
+        bar_format=BAR_FMT,
+        dynamic_ncols=True,
+        colour='magenta',
+    )
+
+    success_count = 0
+    for i, (fname, durl, out, existing, remote) in enumerate(sizes, 1):
+        # Skip files that are already fully downloaded
+        if remote > 0 and existing >= remote:
+            log.success(f"Already complete [{i}/{len(sizes)}]", fname)
+            success_count += 1
+            continue
+        try:
+            ok = download_file(durl, out, i, len(sizes), overall_bar)
+            if ok:
+                success_count += 1
+                log.success(f"Done [{i}/{len(sizes)}]", fname)
+            else:
+                log.error(f"Failed [{i}/{len(sizes)}]", fname)
+        except KeyboardInterrupt:
+            overall_bar.close()
+            print()
+            log.warning("Download interrupted", "progress saved — rerun to continue")
+            sys.exit(0)
+        except Exception as e:
+            log.error(f"Error [{i}/{len(sizes)}]", str(e))
+
+    overall_bar.close()
+    print()
+    log.done("All done", f"{success_count}/{len(sizes)} files  →  {downloads_folder}")
+
+
+if __name__ == '__main__':
+    main()
+
