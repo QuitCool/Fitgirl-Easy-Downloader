@@ -14,18 +14,26 @@ from colorama import Fore, Style, init
 
 init()
 
-# ── Keyboard listener (Ctrl+D opens exclusion menu) ──────────────────────────
+# ── Shared state ──────────────────────────────────────────────────────────────
 
-_menu_event = threading.Event()   # set when user presses Ctrl+D
-_stop_kbd   = threading.Event()   # set to stop the listener thread
-_MENU_SIGNAL = object()           # sentinel returned by download_file
+_menu_trigger  = threading.Event()   # kbd → main: open menu now
+_menu_open     = threading.Event()   # main → dl: terminal in menu mode
+_stop_all      = threading.Event()   # global Ctrl+C shutdown
+_dl_done       = threading.Event()   # download thread finished
+_state_lock    = threading.Lock()    # protects `excluded` set
+_bytes_written = [0]                 # bytes written this session (GIL-safe)
+_log_queue     = []                  # log lines buffered while menu is open
+
+# ── Keyboard listener ─────────────────────────────────────────────────────────
 
 def _kbd_listener():
-    while not _stop_kbd.is_set():
+    while not _stop_all.is_set():
         if msvcrt.kbhit():
             ch = msvcrt.getch()
-            if ch == b'\x04':   # Ctrl+D
-                _menu_event.set()
+            if ch == b'\x04' and not _menu_open.is_set():  # Ctrl+D
+                _menu_trigger.set()
+            elif ch == b'\x03':  # Ctrl+C
+                _stop_all.set()
         time.sleep(0.05)
 
 # ── Console helper ────────────────────────────────────────────────────────────
@@ -42,7 +50,11 @@ class Console:
 
     def _print(self, lvl_color, lvl, msg, obj):
         c = self._C
-        tqdm.write(f"{c['lb']}{self._ts()} » {lvl_color}{lvl} {c['lb']}• {c['w']}{msg} : {lvl_color}{obj}{c['R']}")
+        line = f"{c['lb']}{self._ts()} » {lvl_color}{lvl} {c['lb']}• {c['w']}{msg} : {lvl_color}{obj}{c['R']}"
+        if _menu_open.is_set():
+            _log_queue.append(line)
+        else:
+            tqdm.write(line)
 
     def clear(self):
         os.system("cls" if os.name == "nt" else "clear")
@@ -142,126 +154,272 @@ def get_remote_size(url):
     except Exception:
         return 0
 
-# ── Download ──────────────────────────────────────────────────────────────────
+# ── Download worker (background thread) ──────────────────────────────────────
 
-def download_file(url, output_path, file_index, total_files, overall_bar):
+def _download_worker(sizes, excluded, results, overall_bar_ref):
     """
-    Download *url* to *output_path* with resume support.
-    Drives both a per-file tqdm bar (position=1) and the shared overall_bar (position=0).
-    Returns True on success.
+    Runs in a daemon thread. Iterates sizes sequentially, skipping excluded.
+    overall_bar_ref is a list so the menu can swap the bar after rebuilding it.
     """
-    existing = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+    n = len(sizes)
+    for i, (fname, durl, out, _initial_existing, remote) in enumerate(sizes):
+        if _stop_all.is_set():
+            break
 
-    req_headers = dict(HEADERS)
-    if existing > 0:
-        req_headers['Range'] = f'bytes={existing}-'
-        log.info("Resuming", f"{os.path.basename(output_path)} ({existing:,} bytes already done)")
+        with _state_lock:
+            skip = i in excluded
+        if skip:
+            results[i] = 'skip'
+            log.warning(f"Skipped [{i+1}/{n}]", fname)
+            continue
 
-    try:
-        r = requests.get(url, headers=req_headers, stream=True, timeout=60)
-    except requests.RequestException as e:
-        log.error("Request failed", str(e))
-        return False
+        existing = os.path.getsize(out) if os.path.exists(out) else 0
+        if remote > 0 and existing >= remote:
+            results[i] = True
+            log.success(f"Already complete [{i+1}/{n}]", fname)
+            continue
 
-    # 416 = Range Not Satisfiable → file already fully downloaded
-    if r.status_code == 416:
-        log.success("Already complete", os.path.basename(output_path))
-        return True
+        req_headers = dict(HEADERS)
+        if existing > 0:
+            req_headers['Range'] = f'bytes={existing}-'
+            log.info("Resuming", f"{fname} ({existing:,} bytes already done)")
 
-    if r.status_code not in (200, 206):
-        log.error("Unexpected HTTP status", r.status_code)
-        return False
+        try:
+            r = requests.get(durl, headers=req_headers, stream=True, timeout=60)
+        except requests.RequestException as e:
+            log.error("Request failed", str(e))
+            results[i] = False
+            continue
 
-    chunk_total = int(r.headers.get('content-length', 0))
-    file_total  = existing + chunk_total
+        if r.status_code == 416:
+            log.success("Already complete", fname)
+            results[i] = True
+            continue
 
-    short = os.path.basename(output_path)
-    short = (short[:37] + '...') if len(short) > 40 else short
-    desc  = f"{Fore.CYAN}[{file_index}/{total_files}] {short}{Style.RESET_ALL}"
+        if r.status_code not in (200, 206):
+            log.error("Unexpected HTTP status", r.status_code)
+            results[i] = False
+            continue
 
-    file_bar = tqdm(
-        total=file_total,
-        initial=existing,
-        unit='B',
-        unit_scale=True,
-        unit_divisor=1024,
-        desc=desc,
-        position=1,
-        leave=False,
-        bar_format=BAR_FMT,
-        dynamic_ncols=True,
-        colour='cyan',
+        chunk_total = int(r.headers.get('content-length', 0))
+        file_total  = existing + chunk_total
+        short = fname[:37] + ('...' if len(fname) > 40 else '')
+        desc  = f"{Fore.CYAN}[{i+1}/{n}] {short}{Style.RESET_ALL}"
+
+        file_bar = tqdm(
+            total=file_total, initial=existing,
+            unit='B', unit_scale=True, unit_divisor=1024,
+            desc=desc, position=1, leave=False,
+            bar_format=BAR_FMT, dynamic_ncols=True, colour='cyan',
+        )
+
+        ok   = True
+        mode = 'ab' if existing > 0 else 'wb'
+        try:
+            with open(out, mode) as f:
+                for chunk in r.iter_content(8192):
+                    if _stop_all.is_set():
+                        ok = False
+                        break
+                    if chunk:
+                        f.write(chunk)
+                        _bytes_written[0] += len(chunk)
+                        if not _menu_open.is_set():
+                            file_bar.update(len(chunk))
+                            overall_bar_ref[0].update(len(chunk))
+                        with _state_lock:
+                            if i in excluded:
+                                ok = 'excluded_mid'
+                                break
+        finally:
+            file_bar.close()
+
+        if ok is True:
+            results[i] = True
+            log.success(f"Done [{i+1}/{n}]", fname)
+        elif ok == 'excluded_mid':
+            results[i] = 'skip'
+            log.warning(f"Excluded mid-download [{i+1}/{n}]", fname)
+        else:
+            results[i] = False
+            if not _stop_all.is_set():
+                log.error(f"Failed [{i+1}/{n}]", fname)
+
+    _dl_done.set()
+
+# ── Interactive file manager ──────────────────────────────────────────────────
+
+_MENU_W = 68
+
+def _file_status(i, sizes, excluded, results):
+    """Returns (status_str, pct_int).  status: done|skip|passed|pending"""
+    fname, durl, out, _e, remote = sizes[i]
+    existing_now = os.path.getsize(out) if os.path.exists(out) else 0
+    with _state_lock:
+        is_excl = i in excluded
+    if is_excl:
+        return 'skip', (int(existing_now * 100 / remote) if remote > 0 else 0)
+    res = results.get(i)
+    if res is True or (remote > 0 and existing_now >= remote):
+        return 'done', 100
+    if res == 'skip':
+        return 'passed', (int(existing_now * 100 / remote) if remote > 0 else 0)
+    return 'pending', (int(existing_now * 100 / remote) if remote > 0 else 0)
+
+
+def _render_menu(sizes, excluded, results, cursor, viewport_start):
+    VIEWPORT = 22
+    n = len(sizes)
+    sys.stdout.write('\033[H\033[2J\033[3J')
+    C = Fore.LIGHTMAGENTA_EX
+    Y = Fore.LIGHTYELLOW_EX
+    R = Style.RESET_ALL
+    sys.stdout.write(f"{C}{'─' * _MENU_W}\n")
+    sys.stdout.write(
+        f"  File Manager  "
+        f"{Y}↑↓{C} navigate  {Y}Space{C} toggle skip  {Y}Ctrl+X{C} save & resume\n"
+    )
+    sys.stdout.write(f"{'─' * _MENU_W}{R}\n")
+
+    viewport_end = min(n, viewport_start + VIEWPORT)
+    for i in range(viewport_start, viewport_end):
+        fname  = sizes[i][0]
+        status, pct = _file_status(i, sizes, excluded, results)
+        is_cur = (i == cursor)
+
+        if status == 'done':
+            stat = f"{Fore.LIGHTGREEN_EX} DONE {R}"
+        elif status == 'skip':
+            stat = f"{Fore.LIGHTRED_EX} SKIP {R}"
+        elif status == 'passed':
+            stat = f"{Fore.LIGHTBLACK_EX} PASS {R}"
+        else:
+            stat = f"{Fore.LIGHTBLUE_EX}{pct:3d}% {R}"
+
+        short  = fname[:50] + ('...' if len(fname) > 50 else '')
+        idx    = f"{Fore.LIGHTBLACK_EX}[{i+1:02d}]{R}"
+        cursor_mark = f"  {Y}▶{R} " if is_cur else "    "
+        name_col    = f"{Fore.WHITE}{short}{R}" if is_cur else short
+        sys.stdout.write(f"{cursor_mark}{idx} {stat}  {name_col}\n")
+
+    if n > VIEWPORT:
+        sys.stdout.write(
+            f"  {Fore.LIGHTBLACK_EX}({viewport_start+1}–{viewport_end} of {n}){R}\n"
+        )
+
+    with _state_lock:
+        n_excl = len(excluded)
+    n_rem = sum(
+        1 for i in range(n)
+        if i not in excluded and results.get(i) not in (True, 'skip')
+    )
+    bw = _bytes_written[0]
+    sys.stdout.write(f"{C}{'─' * _MENU_W}{R}\n")
+    sys.stdout.write(
+        f"  Excluded {Fore.LIGHTRED_EX}{n_excl}{R}"
+        f"  │  Remaining {Fore.LIGHTCYAN_EX}{n_rem}{R}"
+        f"  │  Downloaded this run {Fore.LIGHTGREEN_EX}{_fmt_bytes(bw)}{R}\n"
+    )
+    sys.stdout.write(f"  {Fore.LIGHTBLACK_EX}Download continues in the background…{R}\n")
+    sys.stdout.flush()
+
+
+def show_interactive_menu(sizes, excluded, results, overall_bar_ref):
+    VIEWPORT = 22
+    n        = len(sizes)
+    cursor   = 0
+    vp_start = 0
+    _menu_open.set()
+
+    _render_menu(sizes, excluded, results, cursor, vp_start)
+    last_render = time.monotonic()
+
+    while True:
+        # periodic refresh so % counters update live
+        if time.monotonic() - last_render > 0.25:
+            _render_menu(sizes, excluded, results, cursor, vp_start)
+            last_render = time.monotonic()
+
+        if not msvcrt.kbhit():
+            time.sleep(0.05)
+            continue
+
+        ch = msvcrt.getch()
+
+        if ch in (b'\xe0', b'\x00'):          # extended / arrow key
+            ch2 = msvcrt.getch()
+            if ch2 == b'H':                   # ↑
+                cursor = (cursor - 1) % n
+            elif ch2 == b'P':                 # ↓
+                cursor = (cursor + 1) % n
+            # scroll viewport to keep cursor visible
+            if cursor < vp_start:
+                vp_start = cursor
+            elif cursor >= vp_start + VIEWPORT:
+                vp_start = cursor - VIEWPORT + 1
+
+        elif ch == b' ':                      # Space → toggle
+            status, _ = _file_status(cursor, sizes, excluded, results)
+            if status not in ('done', 'passed'):
+                with _state_lock:
+                    if cursor in excluded:
+                        excluded.discard(cursor)
+                    else:
+                        excluded.add(cursor)
+
+        elif ch in (b'\x18', b'\r', b'\n'):   # Ctrl+X / Enter → save & resume
+            break
+
+        _render_menu(sizes, excluded, results, cursor, vp_start)
+        last_render = time.monotonic()
+
+    # ── Restore progress display ──────────────────────────────────────────────
+    overall_bar_ref[0].close()
+
+    with _state_lock:
+        excl_snap = set(excluded)
+
+    new_total    = sum(s[4] for i, s in enumerate(sizes) if i not in excl_snap and s[4] > 0)
+    new_existing = sum(
+        (os.path.getsize(s[2]) if os.path.exists(s[2]) else 0)
+        for i, s in enumerate(sizes) if i not in excl_snap
+    )
+    n_active = sum(
+        1 for i in range(n)
+        if i not in excl_snap and results.get(i) not in (True, 'skip')
     )
 
-    mode = 'ab' if existing > 0 else 'wb'
-    menu_requested = False
-    try:
-        with open(output_path, mode) as f:
-            for chunk in r.iter_content(8192):
-                if chunk:
-                    f.write(chunk)
-                    file_bar.update(len(chunk))
-                    overall_bar.update(len(chunk))
-                    if _menu_event.is_set():
-                        menu_requested = True
-                        break
-    except KeyboardInterrupt:
-        raise
-    finally:
-        file_bar.close()
+    sys.stdout.write('\033[H\033[2J\033[3J')
+    sys.stdout.flush()
 
-    if menu_requested:
-        return _MENU_SIGNAL
-    return True
+    new_bar = tqdm(
+        total=new_total if new_total > 0 else None,
+        initial=new_existing if new_total > 0 else 0,
+        unit='B', unit_scale=True, unit_divisor=1024,
+        desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{n_active} files]{Style.RESET_ALL}",
+        position=0, leave=True,
+        bar_format=BAR_FMT if new_total > 0 else '{desc} {n_fmt} [{rate_fmt}]',
+        dynamic_ncols=True, colour='magenta',
+    )
+    overall_bar_ref[0] = new_bar
 
-# ── Exclusion menu ───────────────────────────────────────────────────────────
+    # flush buffered log lines
+    _menu_open.clear()
+    for line in _log_queue:
+        tqdm.write(line)
+    _log_queue.clear()
+    tqdm.write(f"{Fore.LIGHTBLACK_EX}  Ctrl+D to open file manager{Style.RESET_ALL}")
 
-def show_exclusion_menu(sizes, excluded, overall_bar):
-    overall_bar.clear()
-    C = Console._C
-    tqdm.write(f"\n{Fore.LIGHTMAGENTA_EX}{chr(9472) * 62}")
-    tqdm.write(f"  File List  —  enter numbers to toggle exclusion, Enter to resume")
-    tqdm.write(f"{chr(9472) * 62}{Style.RESET_ALL}")
-    for i, (fname, durl, out, existing, remote) in enumerate(sizes):
-        existing_now = os.path.getsize(out) if os.path.exists(out) else 0
-        if i in excluded:
-            status = f"{Fore.LIGHTRED_EX} SKIP {Style.RESET_ALL}"
-        elif remote > 0 and existing_now >= remote:
-            status = f"{Fore.LIGHTGREEN_EX} DONE {Style.RESET_ALL}"
-        else:
-            pct = int(existing_now * 100 / remote) if remote > 0 else 0
-            status = f"{Fore.LIGHTBLUE_EX}{pct:3d}%{Style.RESET_ALL} "
-        short = fname[:52] + ('...' if len(fname) > 52 else '')
-        tqdm.write(f"  {Fore.LIGHTBLACK_EX}[{i+1:02d}]{Style.RESET_ALL} {status}  {short}")
-    tqdm.write(f"\n{Fore.LIGHTYELLOW_EX}Numbers (e.g. 3,5-7) to toggle, or Enter to resume:{Style.RESET_ALL}")
-    try:
-        raw = input("  > ").strip()
-    except (EOFError, KeyboardInterrupt):
-        raw = ""
-    for part in raw.replace(' ', '').split(','):
-        if '-' in part:
-            bounds = part.split('-')
-            if len(bounds) == 2 and bounds[0].isdigit() and bounds[1].isdigit():
-                for n in range(int(bounds[0]), int(bounds[1]) + 1):
-                    idx = n - 1
-                    if 0 <= idx < len(sizes):
-                        excluded.discard(idx) if idx in excluded else excluded.add(idx)
-        elif part.isdigit():
-            idx = int(part) - 1
-            if 0 <= idx < len(sizes):
-                excluded.discard(idx) if idx in excluded else excluded.add(idx)
-    tqdm.write(f"{Fore.LIGHTMAGENTA_EX}{chr(9472) * 62}{Style.RESET_ALL}\n")
-    overall_bar.refresh()
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-def fmt_bytes(b):
+def _fmt_bytes(b):
     for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
         if b < 1024:
             return f"{b:.1f} {unit}"
         b /= 1024
     return f"{b:.1f} PB"
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     log.clear()
@@ -274,36 +432,33 @@ def main():
         log.error("No URL provided", "exiting")
         sys.exit(1)
 
-    # 1 — scrape FitGirl page for fuckingfast links
+    # 1 ── scrape FitGirl page
     game_name, ff_links = scrape_fitgirl(fitgirl_url)
     downloads_folder = os.path.join("downloads", game_name)
     os.makedirs(downloads_folder, exist_ok=True)
     log.info("Download folder", downloads_folder)
 
-    # 2 — resolve each fuckingfast page → direct download URL (parallel)
+    # 2 ── resolve fuckingfast links in parallel
     WORKERS = min(16, len(ff_links))
     log.info("Resolving direct URLs", f"{len(ff_links)} links  (workers: {WORKERS})")
-    resolved_map = {}  # index → (fname, durl)
+    resolved_map = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         futures = {pool.submit(resolve_fuckingfast, url): i for i, url in enumerate(ff_links)}
         for fut in as_completed(futures):
-            i   = futures[fut]
-            url = ff_links[i]
+            i = futures[fut]
             fname, durl = fut.result()
             if durl:
                 resolved_map[i] = (fname, durl)
                 log.success(f"Resolved [{len(resolved_map)}/{len(ff_links)}]", fname)
             else:
-                log.warning(f"Could not resolve", url)
+                log.warning("Could not resolve", ff_links[i])
 
-    # keep original order
     resolved = [resolved_map[i] for i in sorted(resolved_map)]
-
     if not resolved:
         log.error("No resolvable download URLs found", "exiting")
         sys.exit(1)
 
-    # 3 — fetch file sizes in parallel
+    # 3 ── fetch file sizes in parallel
     log.info("Fetching file sizes", f"{len(resolved)} files  (workers: {WORKERS})")
 
     def _size_entry(item):
@@ -323,81 +478,62 @@ def main():
     total_remote   = sum(s[4] for s in sizes)
     total_existing = sum(s[3] for s in sizes)
 
-    log.info("Total size",         fmt_bytes(total_remote) if total_remote else "unknown")
-    log.info("Already downloaded",  fmt_bytes(total_existing))
-    log.info("Remaining",           fmt_bytes(max(0, total_remote - total_existing)) if total_remote else "unknown")
+    log.info("Total size",         _fmt_bytes(total_remote) if total_remote else "unknown")
+    log.info("Already downloaded",  _fmt_bytes(total_existing))
+    log.info("Remaining",           _fmt_bytes(max(0, total_remote - total_existing)) if total_remote else "unknown")
     tqdm.write("")
 
-    # 4 — download with dual progress bars
-    # If we couldn't fetch sizes, use total=None (spinner) to avoid a broken 0/0 bar
+    # 4 ── overall progress bar
     overall_total = total_remote if total_remote > 0 else None
     overall_bar = tqdm(
         total=overall_total,
         initial=total_existing if overall_total else 0,
-        unit='B',
-        unit_scale=True,
-        unit_divisor=1024,
-        desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{len(resolved)} files]{Style.RESET_ALL}",
-        position=0,
-        leave=True,
+        unit='B', unit_scale=True, unit_divisor=1024,
+        desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{len(sizes)} files]{Style.RESET_ALL}",
+        position=0, leave=True,
         bar_format=BAR_FMT if overall_total else '{desc} {n_fmt} [{rate_fmt}]',
-        dynamic_ncols=True,
-        colour='magenta',
+        dynamic_ncols=True, colour='magenta',
     )
+    overall_bar_ref = [overall_bar]
 
-    # start keyboard listener
-    _stop_kbd.clear()
+    tqdm.write(f"{Fore.LIGHTBLACK_EX}  Ctrl+D open file manager  │  Ctrl+C stop{Style.RESET_ALL}\n")
+
+    # 5 ── shared state
+    excluded = set()
+    results  = {}
+
+    # 6 ── start threads
     kbd_thread = threading.Thread(target=_kbd_listener, daemon=True)
     kbd_thread.start()
-    tqdm.write(f"{Fore.LIGHTBLACK_EX}  Tip: press Ctrl+D to open the file list and exclude files{Style.RESET_ALL}\n")
 
-    excluded = set()
-    success_count = 0
-    i = 0
-    while i < len(sizes):
-        fname, durl, out, existing, remote = sizes[i]
+    dl_thread = threading.Thread(
+        target=_download_worker,
+        args=(sizes, excluded, results, overall_bar_ref),
+        daemon=True,
+    )
+    dl_thread.start()
 
-        if i in excluded:
-            log.warning(f"Skipped [{i+1}/{len(sizes)}]", fname)
-            i += 1
-            continue
+    # 7 ── main loop: handle menu triggers and Ctrl+C
+    try:
+        while not _dl_done.is_set() and not _stop_all.is_set():
+            if _menu_trigger.wait(timeout=0.1):
+                _menu_trigger.clear()
+                show_interactive_menu(sizes, excluded, results, overall_bar_ref)
+    except KeyboardInterrupt:
+        _stop_all.set()
 
-        # refresh existing size in case a previous run partially downloaded it
-        existing = os.path.getsize(out) if os.path.exists(out) else 0
-        if remote > 0 and existing >= remote:
-            log.success(f"Already complete [{i+1}/{len(sizes)}]", fname)
-            success_count += 1
-            i += 1
-            continue
+    if _stop_all.is_set():
+        overall_bar_ref[0].close()
+        tqdm.write("")
+        log.warning("Download interrupted", "progress saved — rerun to continue")
+        sys.exit(0)
 
-        try:
-            result = download_file(durl, out, i + 1, len(sizes), overall_bar)
-        except KeyboardInterrupt:
-            _stop_kbd.set()
-            overall_bar.close()
-            tqdm.write("")
-            log.warning("Download interrupted", "progress saved — rerun to continue")
-            sys.exit(0)
-        except Exception as e:
-            log.error(f"Error [{i+1}/{len(sizes)}]", str(e))
-            i += 1
-            continue
+    dl_thread.join(timeout=5)
+    _stop_all.set()  # stop kbd listener
 
-        if result is _MENU_SIGNAL:
-            _menu_event.clear()
-            show_exclusion_menu(sizes, excluded, overall_bar)
-            # don't advance i — retry current file unless it was just excluded
-            continue
-        elif result is True:
-            success_count += 1
-            log.success(f"Done [{i+1}/{len(sizes)}]", fname)
-        else:
-            log.error(f"Failed [{i+1}/{len(sizes)}]", fname)
-        i += 1
-
-    _stop_kbd.set()
-    overall_bar.close()
+    overall_bar_ref[0].close()
     tqdm.write("")
+    success_count = sum(1 for v in results.values() if v is True)
     log.done("All done", f"{success_count}/{len(sizes)} files  →  {downloads_folder}")
 
 
