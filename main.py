@@ -1,6 +1,9 @@
 import os
 import re
 import sys
+import time
+import threading
+import msvcrt
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
@@ -10,6 +13,20 @@ from datetime import datetime
 from colorama import Fore, Style, init
 
 init()
+
+# ── Keyboard listener (Ctrl+D opens exclusion menu) ──────────────────────────
+
+_menu_event = threading.Event()   # set when user presses Ctrl+D
+_stop_kbd   = threading.Event()   # set to stop the listener thread
+_MENU_SIGNAL = object()           # sentinel returned by download_file
+
+def _kbd_listener():
+    while not _stop_kbd.is_set():
+        if msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch == b'\x04':   # Ctrl+D
+                _menu_event.set()
+        time.sleep(0.05)
 
 # ── Console helper ────────────────────────────────────────────────────────────
 
@@ -177,6 +194,7 @@ def download_file(url, output_path, file_index, total_files, overall_bar):
     )
 
     mode = 'ab' if existing > 0 else 'wb'
+    menu_requested = False
     try:
         with open(output_path, mode) as f:
             for chunk in r.iter_content(8192):
@@ -184,13 +202,56 @@ def download_file(url, output_path, file_index, total_files, overall_bar):
                     f.write(chunk)
                     file_bar.update(len(chunk))
                     overall_bar.update(len(chunk))
+                    if _menu_event.is_set():
+                        menu_requested = True
+                        break
     except KeyboardInterrupt:
-        file_bar.close()
         raise
     finally:
         file_bar.close()
 
+    if menu_requested:
+        return _MENU_SIGNAL
     return True
+
+# ── Exclusion menu ───────────────────────────────────────────────────────────
+
+def show_exclusion_menu(sizes, excluded, overall_bar):
+    overall_bar.clear()
+    C = Console._C
+    tqdm.write(f"\n{Fore.LIGHTMAGENTA_EX}{chr(9472) * 62}")
+    tqdm.write(f"  File List  —  enter numbers to toggle exclusion, Enter to resume")
+    tqdm.write(f"{chr(9472) * 62}{Style.RESET_ALL}")
+    for i, (fname, durl, out, existing, remote) in enumerate(sizes):
+        existing_now = os.path.getsize(out) if os.path.exists(out) else 0
+        if i in excluded:
+            status = f"{Fore.LIGHTRED_EX} SKIP {Style.RESET_ALL}"
+        elif remote > 0 and existing_now >= remote:
+            status = f"{Fore.LIGHTGREEN_EX} DONE {Style.RESET_ALL}"
+        else:
+            pct = int(existing_now * 100 / remote) if remote > 0 else 0
+            status = f"{Fore.LIGHTBLUE_EX}{pct:3d}%{Style.RESET_ALL} "
+        short = fname[:52] + ('...' if len(fname) > 52 else '')
+        tqdm.write(f"  {Fore.LIGHTBLACK_EX}[{i+1:02d}]{Style.RESET_ALL} {status}  {short}")
+    tqdm.write(f"\n{Fore.LIGHTYELLOW_EX}Numbers (e.g. 3,5-7) to toggle, or Enter to resume:{Style.RESET_ALL}")
+    try:
+        raw = input("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+    for part in raw.replace(' ', '').split(','):
+        if '-' in part:
+            bounds = part.split('-')
+            if len(bounds) == 2 and bounds[0].isdigit() and bounds[1].isdigit():
+                for n in range(int(bounds[0]), int(bounds[1]) + 1):
+                    idx = n - 1
+                    if 0 <= idx < len(sizes):
+                        excluded.discard(idx) if idx in excluded else excluded.add(idx)
+        elif part.isdigit():
+            idx = int(part) - 1
+            if 0 <= idx < len(sizes):
+                excluded.discard(idx) if idx in excluded else excluded.add(idx)
+    tqdm.write(f"{Fore.LIGHTMAGENTA_EX}{chr(9472) * 62}{Style.RESET_ALL}\n")
+    overall_bar.refresh()
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -284,28 +345,57 @@ def main():
         colour='magenta',
     )
 
+    # start keyboard listener
+    _stop_kbd.clear()
+    kbd_thread = threading.Thread(target=_kbd_listener, daemon=True)
+    kbd_thread.start()
+    tqdm.write(f"{Fore.LIGHTBLACK_EX}  Tip: press Ctrl+D to open the file list and exclude files{Style.RESET_ALL}\n")
+
+    excluded = set()
     success_count = 0
-    for i, (fname, durl, out, existing, remote) in enumerate(sizes, 1):
-        # Skip files that are already fully downloaded
-        if remote > 0 and existing >= remote:
-            log.success(f"Already complete [{i}/{len(sizes)}]", fname)
-            success_count += 1
+    i = 0
+    while i < len(sizes):
+        fname, durl, out, existing, remote = sizes[i]
+
+        if i in excluded:
+            log.warning(f"Skipped [{i+1}/{len(sizes)}]", fname)
+            i += 1
             continue
+
+        # refresh existing size in case a previous run partially downloaded it
+        existing = os.path.getsize(out) if os.path.exists(out) else 0
+        if remote > 0 and existing >= remote:
+            log.success(f"Already complete [{i+1}/{len(sizes)}]", fname)
+            success_count += 1
+            i += 1
+            continue
+
         try:
-            ok = download_file(durl, out, i, len(sizes), overall_bar)
-            if ok:
-                success_count += 1
-                log.success(f"Done [{i}/{len(sizes)}]", fname)
-            else:
-                log.error(f"Failed [{i}/{len(sizes)}]", fname)
+            result = download_file(durl, out, i + 1, len(sizes), overall_bar)
         except KeyboardInterrupt:
+            _stop_kbd.set()
             overall_bar.close()
             tqdm.write("")
             log.warning("Download interrupted", "progress saved — rerun to continue")
             sys.exit(0)
         except Exception as e:
-            log.error(f"Error [{i}/{len(sizes)}]", str(e))
+            log.error(f"Error [{i+1}/{len(sizes)}]", str(e))
+            i += 1
+            continue
 
+        if result is _MENU_SIGNAL:
+            _menu_event.clear()
+            show_exclusion_menu(sizes, excluded, overall_bar)
+            # don't advance i — retry current file unless it was just excluded
+            continue
+        elif result is True:
+            success_count += 1
+            log.success(f"Done [{i+1}/{len(sizes)}]", fname)
+        else:
+            log.error(f"Failed [{i+1}/{len(sizes)}]", fname)
+        i += 1
+
+    _stop_kbd.set()
     overall_bar.close()
     tqdm.write("")
     log.done("All done", f"{success_count}/{len(sizes)} files  →  {downloads_folder}")
