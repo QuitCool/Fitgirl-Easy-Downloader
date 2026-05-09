@@ -503,7 +503,22 @@ def main():
 
     # 2 ── resolve fuckingfast links in parallel (skip cached + skipped)
     WORKERS = min(16, len(ff_links))
-    to_resolve = {i: url for i, url in enumerate(ff_links) if url not in resolve_cache}
+
+    def _norm(url):
+        return url.rstrip('/')
+
+    # Normalize cache keys on load so old entries still match
+    resolve_cache = {_norm(k): v for k, v in resolve_cache.items()}
+
+    def _save_cache():
+        try:
+            with open(resolve_cache_file, 'w', encoding='utf-8') as _f:
+                json.dump(resolve_cache, _f, indent=2)
+        except OSError:
+            pass
+
+    to_resolve = {i: url for i, url in enumerate(ff_links)
+                  if _norm(url) not in resolve_cache}
     cached_count = len(ff_links) - len(to_resolve)
     if cached_count:
         log.info("Resolve cache hit", f"{cached_count}/{len(ff_links)} links skipped")
@@ -511,31 +526,36 @@ def main():
         log.info("Resolving direct URLs", f"{len(to_resolve)} links  (workers: {WORKERS})")
 
     resolved_map = {}
-    # Fill from cache first
+    # Fill from cache silently (skipped files produce no log)
     for i, url in enumerate(ff_links):
-        if url in resolve_cache:
-            fname, durl = resolve_cache[url]
+        if _norm(url) in resolve_cache:
+            fname, durl = resolve_cache[_norm(url)]
             resolved_map[i] = (fname, durl)
 
-    # Resolve remaining in parallel
+    # Resolve remaining in parallel; save cache after every single result
     if to_resolve:
+        resolve_lock = threading.Lock()
+        visible_count = [cached_count]   # running tally of non-skipped resolves
+
+        def _resolve_one(args):
+            idx, url = args
+            return idx, url, *resolve_fuckingfast(url)
+
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            futures = {pool.submit(resolve_fuckingfast, url): i for i, url in to_resolve.items()}
+            futures = {pool.submit(_resolve_one, (i, url)): i
+                       for i, url in to_resolve.items()}
             for fut in as_completed(futures):
-                i = futures[fut]
-                fname, durl = fut.result()
+                i, url, fname, durl = fut.result()
                 if durl:
                     resolved_map[i] = (fname, durl)
-                    resolve_cache[ff_links[i]] = [fname, durl]
-                    log.success(f"Resolved [{len(resolved_map)}/{len(ff_links)}]", fname)
+                    with resolve_lock:
+                        resolve_cache[_norm(url)] = [fname, durl]
+                        _save_cache()   # persist after every file
+                    if fname not in skipped_names:
+                        visible_count[0] += 1
+                        log.success(f"Resolved [{visible_count[0]}/{len(ff_links)}]", fname)
                 else:
-                    log.warning("Could not resolve", ff_links[i])
-        # Persist updated cache
-        try:
-            with open(resolve_cache_file, 'w', encoding='utf-8') as f:
-                json.dump(resolve_cache, f, indent=2)
-        except OSError:
-            pass
+                    log.warning("Could not resolve", url)
 
     resolved = [resolved_map[i] for i in sorted(resolved_map)]
     if not resolved:
