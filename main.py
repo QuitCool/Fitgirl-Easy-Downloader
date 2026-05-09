@@ -162,28 +162,35 @@ def _download_worker(sizes, excluded, results, overall_bar_ref):
     Runs in a daemon thread. Iterates sizes sequentially, skipping excluded.
     overall_bar_ref is a list so the menu can swap the bar after rebuilding it.
     """
-    n = len(sizes)
+    n        = len(sizes)
+    file_num = 0   # position among non-skipped files (1-based)
+
     for i, (fname, durl, out, _initial_existing, remote) in enumerate(sizes):
         if _stop_all.is_set():
             break
 
         with _state_lock:
-            skip = i in excluded
+            skip     = i in excluded
+            n_active = n - len(excluded)
+
         if skip:
             results[i] = 'skip'
-            log.warning(f"Skipped [{i+1}/{n}]", fname)
+            log.warning("Skipped", fname)
             continue
+
+        file_num += 1
+        pos = f"[{file_num}/{n_active}]"
 
         existing = os.path.getsize(out) if os.path.exists(out) else 0
         if remote > 0 and existing >= remote:
             results[i] = True
-            log.success(f"Already complete [{i+1}/{n}]", fname)
+            log.success(f"Already complete {pos}", fname)
             continue
 
         req_headers = dict(HEADERS)
         if existing > 0:
             req_headers['Range'] = f'bytes={existing}-'
-            log.info("Resuming", f"{fname} ({existing:,} bytes already done)")
+            log.info(f"Resuming {pos}", f"{fname} ({existing:,} bytes already done)")
 
         try:
             r = requests.get(durl, headers=req_headers, stream=True, timeout=60)
@@ -193,7 +200,7 @@ def _download_worker(sizes, excluded, results, overall_bar_ref):
             continue
 
         if r.status_code == 416:
-            log.success("Already complete", fname)
+            log.success(f"Already complete {pos}", fname)
             results[i] = True
             continue
 
@@ -205,7 +212,7 @@ def _download_worker(sizes, excluded, results, overall_bar_ref):
         chunk_total = int(r.headers.get('content-length', 0))
         file_total  = existing + chunk_total
         short = fname[:37] + ('...' if len(fname) > 40 else '')
-        desc  = f"{Fore.CYAN}[{i+1}/{n}] {short}{Style.RESET_ALL}"
+        desc  = f"{Fore.CYAN}{pos} {short}{Style.RESET_ALL}"
 
         file_bar = tqdm(
             total=file_total, initial=existing,
@@ -237,14 +244,14 @@ def _download_worker(sizes, excluded, results, overall_bar_ref):
 
         if ok is True:
             results[i] = True
-            log.success(f"Done [{i+1}/{n}]", fname)
+            log.success(f"Done {pos}", fname)
         elif ok == 'excluded_mid':
             results[i] = 'skip'
-            log.warning(f"Excluded mid-download [{i+1}/{n}]", fname)
+            log.warning(f"Excluded mid-download {pos}", fname)
         else:
             results[i] = False
             if not _stop_all.is_set():
-                log.error(f"Failed [{i+1}/{n}]", fname)
+                log.error(f"Failed {pos}", fname)
 
     _dl_done.set()
 
