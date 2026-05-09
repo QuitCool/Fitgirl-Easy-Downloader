@@ -480,28 +480,76 @@ def main():
     os.makedirs(downloads_folder, exist_ok=True)
     log.info("Download folder", downloads_folder)
 
-    # 2 ── resolve fuckingfast links in parallel
+    skip_file    = os.path.join(downloads_folder, '.skip.json')
+    resolve_cache_file = os.path.join(downloads_folder, '.resolved.json')
+
+    # Load persisted skip list (filenames) so we can skip resolving them
+    skipped_names = set()
+    if os.path.exists(skip_file):
+        try:
+            with open(skip_file, 'r', encoding='utf-8') as f:
+                skipped_names = set(json.load(f))
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Load resolve cache (ff_url → [fname, durl])
+    resolve_cache = {}
+    if os.path.exists(resolve_cache_file):
+        try:
+            with open(resolve_cache_file, 'r', encoding='utf-8') as f:
+                resolve_cache = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # 2 ── resolve fuckingfast links in parallel (skip cached + skipped)
     WORKERS = min(16, len(ff_links))
-    log.info("Resolving direct URLs", f"{len(ff_links)} links  (workers: {WORKERS})")
+    to_resolve = {i: url for i, url in enumerate(ff_links) if url not in resolve_cache}
+    cached_count = len(ff_links) - len(to_resolve)
+    if cached_count:
+        log.info("Resolve cache hit", f"{cached_count}/{len(ff_links)} links skipped")
+    if to_resolve:
+        log.info("Resolving direct URLs", f"{len(to_resolve)} links  (workers: {WORKERS})")
+
     resolved_map = {}
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {pool.submit(resolve_fuckingfast, url): i for i, url in enumerate(ff_links)}
-        for fut in as_completed(futures):
-            i = futures[fut]
-            fname, durl = fut.result()
-            if durl:
-                resolved_map[i] = (fname, durl)
-                log.success(f"Resolved [{len(resolved_map)}/{len(ff_links)}]", fname)
-            else:
-                log.warning("Could not resolve", ff_links[i])
+    # Fill from cache first
+    for i, url in enumerate(ff_links):
+        if url in resolve_cache:
+            fname, durl = resolve_cache[url]
+            resolved_map[i] = (fname, durl)
+
+    # Resolve remaining in parallel
+    if to_resolve:
+        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+            futures = {pool.submit(resolve_fuckingfast, url): i for i, url in to_resolve.items()}
+            for fut in as_completed(futures):
+                i = futures[fut]
+                fname, durl = fut.result()
+                if durl:
+                    resolved_map[i] = (fname, durl)
+                    resolve_cache[ff_links[i]] = [fname, durl]
+                    log.success(f"Resolved [{len(resolved_map)}/{len(ff_links)}]", fname)
+                else:
+                    log.warning("Could not resolve", ff_links[i])
+        # Persist updated cache
+        try:
+            with open(resolve_cache_file, 'w', encoding='utf-8') as f:
+                json.dump(resolve_cache, f, indent=2)
+        except OSError:
+            pass
 
     resolved = [resolved_map[i] for i in sorted(resolved_map)]
     if not resolved:
         log.error("No resolvable download URLs found", "exiting")
         sys.exit(1)
 
-    # 3 ── fetch file sizes in parallel
-    log.info("Fetching file sizes", f"{len(resolved)} files  (workers: {WORKERS})")
+    # 3 ── fetch file sizes in parallel (skip excluded files)
+    # Build initial excluded set from skip list so we can skip their size fetch
+    pre_excluded = {i for i, (fname, _) in enumerate(resolved) if fname in skipped_names}
+    to_size = [(i, item) for i, item in enumerate(resolved) if i not in pre_excluded]
+    skipped_count = len(resolved) - len(to_size)
+    if skipped_count:
+        log.info("Skipping size fetch", f"{skipped_count} excluded files")
+    log.info("Fetching file sizes", f"{len(to_size)} files  (workers: {WORKERS})")
 
     def _size_entry(item):
         fname, durl = item
@@ -510,9 +558,18 @@ def main():
         remote   = get_remote_size(durl)
         return (fname, durl, out, existing, remote)
 
+    def _size_entry_zero(item):
+        fname, durl = item
+        out = os.path.join(downloads_folder, fname)
+        return (fname, durl, out, 0, 0)
+
     sizes_map = {}
+    # Excluded files get zero-size placeholder (no network call)
+    for i in pre_excluded:
+        sizes_map[i] = _size_entry_zero(resolved[i])
+    # Fetch sizes for active files
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {pool.submit(_size_entry, item): i for i, item in enumerate(resolved)}
+        futures = {pool.submit(_size_entry, resolved[i]): i for i, _ in to_size}
         for fut in as_completed(futures):
             sizes_map[futures[fut]] = fut.result()
 
@@ -541,20 +598,9 @@ def main():
     tqdm.write(f"{Fore.LIGHTBLACK_EX}  Ctrl+D open file manager  │  Ctrl+C stop{Style.RESET_ALL}\n")
 
     # 5 ── shared state
-    skip_file = os.path.join(downloads_folder, '.skip.json')
-    excluded  = set()
-    # Load previously skipped filenames and map back to current indices
-    if os.path.exists(skip_file):
-        try:
-            with open(skip_file, 'r', encoding='utf-8') as f:
-                skipped_names = set(json.load(f))
-            for idx, s in enumerate(sizes):
-                if s[0] in skipped_names:
-                    excluded.add(idx)
-            if excluded:
-                log.info("Loaded skipped files", f"{len(excluded)} from previous session")
-        except (OSError, json.JSONDecodeError):
-            pass
+    excluded = set(pre_excluded)   # already populated from skip list above
+    if excluded:
+        log.info("Loaded skipped files", f"{len(excluded)} from previous session")
     results  = {}
 
     # 6 ── start threads
