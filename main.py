@@ -165,6 +165,14 @@ def _download_worker(sizes, excluded, results, overall_bar_ref):
     n        = len(sizes)
     file_num = 0   # position among non-skipped files (1-based)
 
+    def _update_overall_desc():
+        with _state_lock:
+            n_excl = len(excluded)
+        remaining = n - n_excl - file_num
+        overall_bar_ref[0].set_description(
+            f"{Fore.LIGHTMAGENTA_EX}Overall  [{remaining} remaining]{Style.RESET_ALL}"
+        )
+
     for i, (fname, durl, out, _initial_existing, remote) in enumerate(sizes):
         if _stop_all.is_set():
             break
@@ -184,6 +192,7 @@ def _download_worker(sizes, excluded, results, overall_bar_ref):
         existing = os.path.getsize(out) if os.path.exists(out) else 0
         if remote > 0 and existing >= remote:
             results[i] = True
+            _update_overall_desc()
             log.success(f"Already complete {pos}", fname)
             continue
 
@@ -197,11 +206,13 @@ def _download_worker(sizes, excluded, results, overall_bar_ref):
         except requests.RequestException as e:
             log.error("Request failed", str(e))
             results[i] = False
+            _update_overall_desc()
             continue
 
         if r.status_code == 416:
-            log.success(f"Already complete {pos}", fname)
             results[i] = True
+            _update_overall_desc()
+            log.success(f"Already complete {pos}", fname)
             continue
 
         if r.status_code not in (200, 206):
@@ -244,12 +255,15 @@ def _download_worker(sizes, excluded, results, overall_bar_ref):
 
         if ok is True:
             results[i] = True
+            _update_overall_desc()
             log.success(f"Done {pos}", fname)
         elif ok == 'excluded_mid':
             results[i] = 'skip'
+            _update_overall_desc()
             log.warning(f"Excluded mid-download {pos}", fname)
         else:
             results[i] = False
+            _update_overall_desc()
             if not _stop_all.is_set():
                 log.error(f"Failed {pos}", fname)
 
@@ -445,7 +459,7 @@ def show_interactive_menu(sizes, excluded, results, overall_bar_ref, skip_file=N
         total=new_total if new_total > 0 else None,
         initial=new_existing if new_total > 0 else 0,
         unit='B', unit_scale=True, unit_divisor=1024,
-        desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{n_active} files]{Style.RESET_ALL}",
+        desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{n_active} remaining]{Style.RESET_ALL}",
         position=0, leave=True,
         bar_format=BAR_FMT if new_total > 0 else '{desc} {n_fmt} [{rate_fmt}]',
         dynamic_ncols=True, colour='magenta',
@@ -616,7 +630,7 @@ def main():
         total=overall_total,
         initial=total_existing if overall_total else 0,
         unit='B', unit_scale=True, unit_divisor=1024,
-        desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{n_active_initial} files]{Style.RESET_ALL}",
+        desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{n_active_initial} remaining]{Style.RESET_ALL}",
         position=0, leave=True,
         bar_format=BAR_FMT if overall_total else '{desc} {n_fmt} [{rate_fmt}]',
         dynamic_ncols=True, colour='magenta',
