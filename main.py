@@ -269,17 +269,24 @@ def _file_status(i, sizes, excluded, results):
 
 def _render_menu(sizes, excluded, results, cursor, viewport_start):
     VIEWPORT = 22
-    n = len(sizes)
-    sys.stdout.write('\033[H\033[2J\033[3J')
-    C = Fore.LIGHTMAGENTA_EX
-    Y = Fore.LIGHTYELLOW_EX
-    R = Style.RESET_ALL
-    sys.stdout.write(f"{C}{'─' * _MENU_W}\n")
-    sys.stdout.write(
+    n  = len(sizes)
+    C  = Fore.LIGHTMAGENTA_EX
+    Y  = Fore.LIGHTYELLOW_EX
+    R  = Style.RESET_ALL
+    try:
+        cols = os.get_terminal_size().columns
+    except OSError:
+        cols = _MENU_W
+
+    buf = []
+    buf.append('\033[H')   # cursor to top-left — overwrite in place, no flicker
+
+    buf.append(f"{C}{'─' * _MENU_W}\033[K\n")
+    buf.append(
         f"  File Manager  "
-        f"{Y}↑↓{C} navigate  {Y}Space{C} toggle skip  {Y}Ctrl+X{C} save & resume\n"
+        f"{Y}↑↓{C} navigate  {Y}Space{C} toggle  {Y}Ctrl+X{C} save & resume\033[K\n"
     )
-    sys.stdout.write(f"{'─' * _MENU_W}{R}\n")
+    buf.append(f"{'─' * _MENU_W}{R}\033[K\n")
 
     viewport_end = min(n, viewport_start + VIEWPORT)
     for i in range(viewport_start, viewport_end):
@@ -296,31 +303,35 @@ def _render_menu(sizes, excluded, results, cursor, viewport_start):
         else:
             stat = f"{Fore.LIGHTBLUE_EX}{pct:3d}% {R}"
 
-        short  = fname[:50] + ('...' if len(fname) > 50 else '')
-        idx    = f"{Fore.LIGHTBLACK_EX}[{i+1:02d}]{R}"
-        cursor_mark = f"  {Y}▶{R} " if is_cur else "    "
-        name_col    = f"{Fore.WHITE}{short}{R}" if is_cur else short
-        sys.stdout.write(f"{cursor_mark}{idx} {stat}  {name_col}\n")
+        short      = fname[:50] + ('...' if len(fname) > 50 else '')
+        idx        = f"{Fore.LIGHTBLACK_EX}[{i+1:02d}]{R}"
+        mark       = f"  {Y}▶{R} " if is_cur else "    "
+        name_col   = f"{Fore.WHITE}{short}{R}" if is_cur else short
+        buf.append(f"{mark}{idx} {stat}  {name_col}\033[K\n")
 
     if n > VIEWPORT:
-        sys.stdout.write(
-            f"  {Fore.LIGHTBLACK_EX}({viewport_start+1}–{viewport_end} of {n}){R}\n"
+        buf.append(
+            f"  {Fore.LIGHTBLACK_EX}({viewport_start+1}–{viewport_end} of {n})  "
+            f"scroll ↑↓{R}\033[K\n"
         )
 
     with _state_lock:
         n_excl = len(excluded)
     n_rem = sum(
-        1 for i in range(n)
-        if i not in excluded and results.get(i) not in (True, 'skip')
+        1 for j in range(n)
+        if j not in excluded and results.get(j) not in (True, 'skip')
     )
     bw = _bytes_written[0]
-    sys.stdout.write(f"{C}{'─' * _MENU_W}{R}\n")
-    sys.stdout.write(
+    buf.append(f"{C}{'─' * _MENU_W}{R}\033[K\n")
+    buf.append(
         f"  Excluded {Fore.LIGHTRED_EX}{n_excl}{R}"
         f"  │  Remaining {Fore.LIGHTCYAN_EX}{n_rem}{R}"
-        f"  │  Downloaded this run {Fore.LIGHTGREEN_EX}{_fmt_bytes(bw)}{R}\n"
+        f"  │  Downloaded {Fore.LIGHTGREEN_EX}{_fmt_bytes(bw)}{R}\033[K\n"
     )
-    sys.stdout.write(f"  {Fore.LIGHTBLACK_EX}Download continues in the background…{R}\n")
+    buf.append(f"  {Fore.LIGHTBLACK_EX}Download continues in the background…{R}\033[K\n")
+    buf.append('\033[J')  # erase anything below (handles shrinking lists)
+
+    sys.stdout.write(''.join(buf))
     sys.stdout.flush()
 
 
@@ -331,47 +342,59 @@ def show_interactive_menu(sizes, excluded, results, overall_bar_ref):
     vp_start = 0
     _menu_open.set()
 
+    # First frame: clear screen so old content doesn't bleed through
+    sys.stdout.write('\033[H\033[2J\033[3J')
+    sys.stdout.flush()
     _render_menu(sizes, excluded, results, cursor, vp_start)
-    last_render = time.monotonic()
+    last_periodic = time.monotonic()
 
     while True:
-        # periodic refresh so % counters update live
-        if time.monotonic() - last_render > 0.25:
-            _render_menu(sizes, excluded, results, cursor, vp_start)
-            last_render = time.monotonic()
+        # Drain ALL pending keypresses before redrawing (kills repeat-key lag)
+        dirty = False
+        while msvcrt.kbhit():
+            ch = msvcrt.getch()
 
-        if not msvcrt.kbhit():
-            time.sleep(0.05)
-            continue
+            if ch in (b'\xe0', b'\x00'):        # arrow / extended key
+                if msvcrt.kbhit():
+                    ch2 = msvcrt.getch()
+                    if ch2 == b'H':              # ↑
+                        cursor = (cursor - 1) % n
+                    elif ch2 == b'P':            # ↓
+                        cursor = (cursor + 1) % n
+                    if cursor < vp_start:
+                        vp_start = cursor
+                    elif cursor >= vp_start + VIEWPORT:
+                        vp_start = cursor - VIEWPORT + 1
+                    dirty = True
 
-        ch = msvcrt.getch()
+            elif ch == b' ':                     # Space → toggle
+                status, _ = _file_status(cursor, sizes, excluded, results)
+                if status not in ('done', 'passed'):
+                    with _state_lock:
+                        if cursor in excluded:
+                            excluded.discard(cursor)
+                        else:
+                            excluded.add(cursor)
+                    dirty = True
 
-        if ch in (b'\xe0', b'\x00'):          # extended / arrow key
-            ch2 = msvcrt.getch()
-            if ch2 == b'H':                   # ↑
-                cursor = (cursor - 1) % n
-            elif ch2 == b'P':                 # ↓
-                cursor = (cursor + 1) % n
-            # scroll viewport to keep cursor visible
-            if cursor < vp_start:
-                vp_start = cursor
-            elif cursor >= vp_start + VIEWPORT:
-                vp_start = cursor - VIEWPORT + 1
+            elif ch in (b'\x18', b'\r', b'\n'): # Ctrl+X / Enter → exit
+                # flush remaining keys and break
+                while msvcrt.kbhit():
+                    msvcrt.getch()
+                dirty = False  # redraw handled after break
+                cursor = -1    # sentinel
+                break
 
-        elif ch == b' ':                      # Space → toggle
-            status, _ = _file_status(cursor, sizes, excluded, results)
-            if status not in ('done', 'passed'):
-                with _state_lock:
-                    if cursor in excluded:
-                        excluded.discard(cursor)
-                    else:
-                        excluded.add(cursor)
-
-        elif ch in (b'\x18', b'\r', b'\n'):   # Ctrl+X / Enter → save & resume
+        if cursor == -1:
             break
 
-        _render_menu(sizes, excluded, results, cursor, vp_start)
-        last_render = time.monotonic()
+        # Periodic live refresh every 250 ms even without input
+        now = time.monotonic()
+        if dirty or now - last_periodic > 0.25:
+            _render_menu(sizes, excluded, results, cursor, vp_start)
+            last_periodic = now
+
+        time.sleep(0.01)   # 10 ms idle sleep — imperceptible but CPU-friendly
 
     # ── Restore progress display ──────────────────────────────────────────────
     overall_bar_ref[0].close()
