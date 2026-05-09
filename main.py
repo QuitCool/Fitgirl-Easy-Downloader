@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import sys
@@ -330,7 +331,7 @@ def _render_menu(sizes, excluded, results, cursor, viewport_start, viewport_size
     sys.stdout.flush()
 
 
-def show_interactive_menu(sizes, excluded, results, overall_bar_ref):
+def show_interactive_menu(sizes, excluded, results, overall_bar_ref, skip_file=None):
     n        = len(sizes)
     cursor   = 0
     vp_start = 0
@@ -422,6 +423,16 @@ def show_interactive_menu(sizes, excluded, results, overall_bar_ref):
     # Leave alternate screen — original progress output is restored automatically
     sys.stdout.write('\033[?1049l')
     sys.stdout.flush()
+
+    # Persist excluded filenames so they survive restarts
+    if skip_file is not None:
+        with _state_lock:
+            excl_names = [sizes[i][0] for i in sorted(excluded) if i < len(sizes)]
+        try:
+            with open(skip_file, 'w', encoding='utf-8') as f:
+                json.dump(excl_names, f, indent=2)
+        except OSError:
+            pass
 
     new_bar = tqdm(
         total=new_total if new_total > 0 else None,
@@ -530,7 +541,20 @@ def main():
     tqdm.write(f"{Fore.LIGHTBLACK_EX}  Ctrl+D open file manager  │  Ctrl+C stop{Style.RESET_ALL}\n")
 
     # 5 ── shared state
-    excluded = set()
+    skip_file = os.path.join(downloads_folder, '.skip.json')
+    excluded  = set()
+    # Load previously skipped filenames and map back to current indices
+    if os.path.exists(skip_file):
+        try:
+            with open(skip_file, 'r', encoding='utf-8') as f:
+                skipped_names = set(json.load(f))
+            for idx, s in enumerate(sizes):
+                if s[0] in skipped_names:
+                    excluded.add(idx)
+            if excluded:
+                log.info("Loaded skipped files", f"{len(excluded)} from previous session")
+        except (OSError, json.JSONDecodeError):
+            pass
     results  = {}
 
     # 6 ── start threads
@@ -549,7 +573,7 @@ def main():
         while not _dl_done.is_set() and not _stop_all.is_set():
             if _menu_trigger.wait(timeout=0.1):
                 _menu_trigger.clear()
-                show_interactive_menu(sizes, excluded, results, overall_bar_ref)
+                show_interactive_menu(sizes, excluded, results, overall_bar_ref, skip_file)
     except KeyboardInterrupt:
         _stop_all.set()
 
