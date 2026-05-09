@@ -561,6 +561,30 @@ def _fmt_bytes(b):
         b /= 1024
     return f"{b:.1f} PB"
 
+
+def _normalize_fitgirl_url(raw):
+    """Accept a slug, partial or full FitGirl URL; return canonical https URL.
+
+    Accepted forms:
+      god-of-war
+      fitgirl-repacks.site/god-of-war
+      https://fitgirl-repacks.site/god-of-war
+      https://fitgirl-repacks.site/god-of-war/
+    """
+    s = raw.strip()
+    if not s:
+        return s
+    if '://' not in s:
+        s = 'https://' + s
+    parsed = urlparse(s)
+    if 'fitgirl-repacks.site' not in parsed.netloc:
+        # Input was a bare slug like "god-of-war"
+        slug = raw.strip().strip('/')
+        s = f'https://fitgirl-repacks.site/{slug}'
+    if not s.endswith('/'):
+        s += '/'
+    return s
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -569,10 +593,11 @@ def main():
     tqdm.write(f"  FitGirl Easy Downloader  [PARALLEL × {N_DL_WORKERS}]")
     tqdm.write(f"{'─' * 62}{Style.RESET_ALL}\n")
 
-    fitgirl_url = log.prompt("Enter FitGirl game URL : ").strip()
+    fitgirl_url = _normalize_fitgirl_url(log.prompt("Enter FitGirl game URL : ").strip())
     if not fitgirl_url:
         log.error("No URL provided", "exiting")
         sys.exit(1)
+    log.info("Using URL", fitgirl_url)
 
     # 1 ── scrape FitGirl page
     game_name, ff_links = scrape_fitgirl(fitgirl_url)
