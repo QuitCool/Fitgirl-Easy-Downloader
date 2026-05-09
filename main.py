@@ -603,12 +603,13 @@ def main():
     tqdm.write("")
 
     # 4 ── overall progress bar
+    n_active_initial = len(sizes) - len(pre_excluded)
     overall_total = total_remote if total_remote > 0 else None
     overall_bar = tqdm(
         total=overall_total,
         initial=total_existing if overall_total else 0,
         unit='B', unit_scale=True, unit_divisor=1024,
-        desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{len(sizes)} files]{Style.RESET_ALL}",
+        desc=f"{Fore.LIGHTMAGENTA_EX}Overall  [{n_active_initial} files]{Style.RESET_ALL}",
         position=0, leave=True,
         bar_format=BAR_FMT if overall_total else '{desc} {n_fmt} [{rate_fmt}]',
         dynamic_ncols=True, colour='magenta',
