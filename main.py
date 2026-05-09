@@ -267,19 +267,15 @@ def _file_status(i, sizes, excluded, results):
     return 'pending', (int(existing_now * 100 / remote) if remote > 0 else 0)
 
 
-def _render_menu(sizes, excluded, results, cursor, viewport_start):
-    VIEWPORT = 22
+def _render_menu(sizes, excluded, results, cursor, viewport_start, viewport_size):
+    VIEWPORT = viewport_size
     n  = len(sizes)
     C  = Fore.LIGHTMAGENTA_EX
     Y  = Fore.LIGHTYELLOW_EX
     R  = Style.RESET_ALL
-    try:
-        cols = os.get_terminal_size().columns
-    except OSError:
-        cols = _MENU_W
 
     buf = []
-    buf.append('\033[H')   # cursor to top-left — overwrite in place, no flicker
+    buf.append('\033[H')   # cursor to top-left of alternate screen
 
     buf.append(f"{C}{'─' * _MENU_W}\033[K\n")
     buf.append(
@@ -309,11 +305,10 @@ def _render_menu(sizes, excluded, results, cursor, viewport_start):
         name_col   = f"{Fore.WHITE}{short}{R}" if is_cur else short
         buf.append(f"{mark}{idx} {stat}  {name_col}\033[K\n")
 
-    if n > VIEWPORT:
-        buf.append(
-            f"  {Fore.LIGHTBLACK_EX}({viewport_start+1}–{viewport_end} of {n})  "
-            f"scroll ↑↓{R}\033[K\n"
-        )
+    buf.append(
+        f"  {Fore.LIGHTBLACK_EX}({viewport_start+1}–{viewport_end} of {n})  "
+        f"scroll ↑↓{R}\033[K\n"
+    )
 
     with _state_lock:
         n_excl = len(excluded)
@@ -329,28 +324,37 @@ def _render_menu(sizes, excluded, results, cursor, viewport_start):
         f"  │  Downloaded {Fore.LIGHTGREEN_EX}{_fmt_bytes(bw)}{R}\033[K\n"
     )
     buf.append(f"  {Fore.LIGHTBLACK_EX}Download continues in the background…{R}\033[K\n")
-    buf.append('\033[J')  # erase anything below (handles shrinking lists)
+    buf.append('\033[J')  # erase anything below
 
     sys.stdout.write(''.join(buf))
     sys.stdout.flush()
 
 
 def show_interactive_menu(sizes, excluded, results, overall_bar_ref):
-    VIEWPORT = 22
     n        = len(sizes)
     cursor   = 0
     vp_start = 0
     _menu_open.set()
 
-    # First frame: clear screen so old content doesn't bleed through
-    sys.stdout.write('\033[H\033[2J\033[3J')
+    def _vp_size():
+        try:
+            return max(3, os.get_terminal_size().lines - 7)
+        except OSError:
+            return 15
+
+    VIEWPORT = _vp_size()
+
+    # Enter alternate screen — own fixed canvas, never scrolls
+    sys.stdout.write('\033[?1049h\033[H')
     sys.stdout.flush()
-    _render_menu(sizes, excluded, results, cursor, vp_start)
+    _render_menu(sizes, excluded, results, cursor, vp_start, VIEWPORT)
     last_periodic = time.monotonic()
 
     while True:
-        # Drain ALL pending keypresses before redrawing (kills repeat-key lag)
-        dirty = False
+        # Drain ALL pending keypresses; deduplicate Space to one toggle per cycle
+        dirty        = False
+        space_seen   = False
+
         while msvcrt.kbhit():
             ch = msvcrt.getch()
 
@@ -367,23 +371,25 @@ def show_interactive_menu(sizes, excluded, results, overall_bar_ref):
                         vp_start = cursor - VIEWPORT + 1
                     dirty = True
 
-            elif ch == b' ':                     # Space → toggle
-                status, _ = _file_status(cursor, sizes, excluded, results)
-                if status not in ('done', 'passed'):
-                    with _state_lock:
-                        if cursor in excluded:
-                            excluded.discard(cursor)
-                        else:
-                            excluded.add(cursor)
-                    dirty = True
+            elif ch == b' ':                     # Space — record once, apply after drain
+                space_seen = True
 
             elif ch in (b'\x18', b'\r', b'\n'): # Ctrl+X / Enter → exit
-                # flush remaining keys and break
                 while msvcrt.kbhit():
                     msvcrt.getch()
-                dirty = False  # redraw handled after break
                 cursor = -1    # sentinel
                 break
+
+        # Apply Space toggle exactly once (ignore key-repeat duplicates)
+        if space_seen and cursor != -1:
+            status, _ = _file_status(cursor, sizes, excluded, results)
+            if status not in ('done', 'passed'):
+                with _state_lock:
+                    if cursor in excluded:
+                        excluded.discard(cursor)
+                    else:
+                        excluded.add(cursor)
+                dirty = True
 
         if cursor == -1:
             break
@@ -391,10 +397,11 @@ def show_interactive_menu(sizes, excluded, results, overall_bar_ref):
         # Periodic live refresh every 250 ms even without input
         now = time.monotonic()
         if dirty or now - last_periodic > 0.25:
-            _render_menu(sizes, excluded, results, cursor, vp_start)
+            VIEWPORT = _vp_size()          # recheck on terminal resize
+            _render_menu(sizes, excluded, results, cursor, vp_start, VIEWPORT)
             last_periodic = now
 
-        time.sleep(0.01)   # 10 ms idle sleep — imperceptible but CPU-friendly
+        time.sleep(0.01)   # 10 ms idle sleep
 
     # ── Restore progress display ──────────────────────────────────────────────
     overall_bar_ref[0].close()
@@ -412,7 +419,8 @@ def show_interactive_menu(sizes, excluded, results, overall_bar_ref):
         if i not in excl_snap and results.get(i) not in (True, 'skip')
     )
 
-    sys.stdout.write('\033[H\033[2J\033[3J')
+    # Leave alternate screen — original progress output is restored automatically
+    sys.stdout.write('\033[?1049l')
     sys.stdout.flush()
 
     new_bar = tqdm(
