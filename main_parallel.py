@@ -91,7 +91,7 @@ HEADERS = {
 }
 
 # Shorter bar to fit 8 simultaneous bars on screen
-BAR_FMT = '{desc} {percentage:3.0f}%|{bar:18}| {n_fmt}/{total_fmt} [{rate_fmt}, ETA {remaining}]'
+BAR_FMT = '{desc} {percentage:3.0f}%|{bar:18}| {n_fmt}/{total_fmt} [{rate_fmt}, Time {remaining}]'
 
 # ── Scraping helpers ──────────────────────────────────────────────────────────
 
